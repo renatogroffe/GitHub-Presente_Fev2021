@@ -1,0 +1,104 @@
+name: dotnet5-selenium-artifacts-slack-docker-azure
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGEM_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME }}/sitedistancias-githubpresente
+  CAMINHO_PROJETO_WEBAPP: ./ConversorDistancias
+  CAMINHO_PROJETO_TESTES: ./ConversorDistancias.Testes
+  NOME_WEBAPP: groffe-githubpresente
+  CAMINHO_SCREENSHOTS_SELENIUM: ./ConversorDistancias.Testes/bin/Debug/net5.0/*.png
+
+jobs:
+  build-docker-tests-push:
+
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: 5.0.x
+
+    - name: Build de imagem
+      run: |
+        cd ${{ env.CAMINHO_PROJETO_WEBAPP }}
+        docker build . --file Dockerfile --tag ${{ env.IMAGEM_DOCKERHUB }}:latest
+
+    - name: Criação de container para testes com o site
+      run: |
+        docker run --name site-testes -p 1234:80 -d ${{ env.IMAGEM_DOCKERHUB }}:latest
+        docker container ls
+
+    - name: Testes com Selenium WebDriver + Chrome Driver
+      env:
+        UrlTelaConversaoDistancias: http://localhost:1234
+      run: dotnet test ${{ env.CAMINHO_PROJETO_TESTES }} --verbosity minimal --logger:"html;LogFileName=resultado-testes.html"
+      
+    - name: Login no Docker Hub
+      uses: docker/login-action@v1.8.0
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+    - name: Geração de tag com número do Build e Push no Docker Hub
+      run: |
+        docker tag ${{ env.IMAGEM_DOCKERHUB }}:latest ${{ env.IMAGEM_DOCKERHUB }}:$GITHUB_RUN_NUMBER
+        docker push --all-tags ${{ env.IMAGEM_DOCKERHUB }}
+
+    - name: Upload como Artifact do Report de Testes com Falhas
+      uses: actions/upload-artifact@v2.2.2
+      if: failure()
+      env:
+        CAMINHO_RELATORIO_ERROS: ${{ env.CAMINHO_PROJETO_TESTES }}/TestResults/resultado-testes.html
+      with:
+        name: resultado-erros-testes
+        path: ${{ env.CAMINHO_RELATORIO_ERROS }}
+        retention-days: 30
+
+    - name: Upload como Artifact dos Screenshots gerados pelo Selenium WebDriver
+      uses: actions/upload-artifact@v2.2.2
+      if: failure()
+      with:
+        name: screenshots-selenium
+        path: ${{ env.CAMINHO_SCREENSHOTS_SELENIUM }}
+        retention-days: 30
+
+    - name: Notificação de erro na execução
+      if: failure()
+      shell: pwsh
+      run: |
+        $Execucao = '{ "workflow": "' + ${env:GITHUB_WORKFLOW} + '", "numExecucao": ' + ${env:GITHUB_RUN_NUMBER} + ' }'
+        Write-Host $Execucao
+        Invoke-RestMethod -Uri "${{ secrets.URL_LOGIC_APP_FALHA }}" -Method POST -ContentType "application/json" -Body $Execucao
+
+  deployment-azwebapp:
+    needs: [build-docker-tests-push]
+
+    runs-on: ubuntu-20.04
+
+    steps:
+    - name: Azure Login - Conectando com Credenciais no Azure
+      uses: Azure/login@v1.1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Azure WebApp - Deployment da Aplicacao
+      uses: Azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.NOME_WEBAPP }}
+        images: '${{ env.IMAGEM_DOCKERHUB }}:${{ github.run_number }}'
+        
+    - name: Notificação de sucesso na execução
+      if: success()
+      shell: pwsh
+      run: |
+        $Execucao = '{ "workflow": "' + ${env:GITHUB_WORKFLOW} + '", "numExecucao": ' + ${env:GITHUB_RUN_NUMBER} + ' }'
+        Write-Host $Execucao
+        Invoke-RestMethod -Uri "${{ secrets.URL_LOGIC_APP_SUCESSO }}" -Method POST -ContentType "application/json" -Body $Execucao
